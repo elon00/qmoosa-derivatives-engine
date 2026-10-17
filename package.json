@@ -1,0 +1,26 @@
+{
+  "name": "@qmoosa/derivatives-engine",
+  "version": "1.0.0",
+  "description": "Perpetual Futures & Synthetic Derivatives — Margin Engine, Position Ledger & Liquidation System",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/engine.test.mjs",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "keywords": [
+    "qmoosa",
+    "derivatives",
+    "engine",
+    "perpetual",
+    "positions",
+    "liquidation"
+  ],
+  "author": "elon00",
+  "license": "MIT"
+}

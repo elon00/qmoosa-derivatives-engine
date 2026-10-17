@@ -1,5 +1,5 @@
 /**
- * QMOOSA Derivatives Engine — Margin Management, Position Ledger, and Liquidation State Machine
+ * QMOOSA Derivatives Engine — Margin Management, Position Ledger, Authorization & Liquidation State Machine
  */
 
 export const WAD = 10n ** 18n;
@@ -8,6 +8,7 @@ export const MAX_LEVERAGE = 20n;
 export const MIN_LEVERAGE = 1n;
 export const DEFAULT_MAINTENANCE_MARGIN_BPS = 500n; // 5.00%
 export const MAX_FUNDING_RATE_BPS = 500n; // +/- 5.00% cap
+export const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours in milliseconds
 
 export interface PositionState {
   isLong: boolean;
@@ -98,6 +99,7 @@ export interface MarketState {
   fundingRateBps: bigint;
   maintenanceMarginBps: bigint;
   lastFundingSettledAt: number;
+  insuranceFundBalanceUsd: bigint;
 }
 
 export interface Position extends PositionState {
@@ -129,12 +131,15 @@ export interface LiquidationReceipt {
 export class DerivativesEngine {
   private markets: Map<string, MarketState> = new Map();
   private positions: Map<string, Position> = new Map();
+  private approvedOperators: Map<string, Set<string>> = new Map(); // account -> approved operators
   private nextPositionNonce: bigint = 1n;
 
   public registerMarket(
     symbol: string,
     initialPrice: bigint,
-    maintenanceMarginBps: bigint = DEFAULT_MAINTENANCE_MARGIN_BPS
+    maintenanceMarginBps: bigint = DEFAULT_MAINTENANCE_MARGIN_BPS,
+    initialInsuranceFundUsd: bigint = 0n,
+    initialTimestamp?: number
   ): MarketState {
     if (!symbol || symbol.trim().length === 0) {
       throw new Error("Invalid market symbol");
@@ -149,15 +154,41 @@ export class DerivativesEngine {
       indexPrice: initialPrice,
       fundingRateBps: 0n,
       maintenanceMarginBps,
-      lastFundingSettledAt: Date.now()
+      lastFundingSettledAt: initialTimestamp ?? Date.now(),
+      insuranceFundBalanceUsd: initialInsuranceFundUsd
     };
 
     this.markets.set(market.symbol, market);
-    return market;
+    return { ...market };
+  }
+
+  public setApprovedOperator(account: string, operator: string, approved: boolean): void {
+    if (!account || !operator) throw new Error("Account and operator must be valid strings");
+    const acc = account.toLowerCase();
+    const op = operator.toLowerCase();
+    if (!this.approvedOperators.has(acc)) {
+      this.approvedOperators.set(acc, new Set());
+    }
+    const ops = this.approvedOperators.get(acc)!;
+    if (approved) {
+      ops.add(op);
+    } else {
+      ops.delete(op);
+    }
+  }
+
+  public isAuthorizedCaller(account: string, caller: string): boolean {
+    const acc = account.toLowerCase();
+    const c = caller.toLowerCase();
+    if (acc === c) return true;
+    const ops = this.approvedOperators.get(acc);
+    return ops ? ops.has(c) : false;
   }
 
   public updatePrices(symbol: string, markPrice: bigint, indexPrice: bigint): MarketState {
-    const market = this.getMarket(symbol);
+    const s = symbol.toUpperCase();
+    const market = this.markets.get(s);
+    if (!market) throw new Error(`Market ${s} is not registered`);
     if (markPrice <= 0n || indexPrice <= 0n) {
       throw new RangeError("Prices must be strictly positive");
     }
@@ -165,10 +196,11 @@ export class DerivativesEngine {
     market.markPrice = markPrice;
     market.indexPrice = indexPrice;
     market.fundingRateBps = calculateFundingRate(markPrice, indexPrice);
-    return market;
+    return { ...market };
   }
 
   public openPosition(params: {
+    caller?: string;
     account: string;
     symbol: string;
     isLong: boolean;
@@ -176,9 +208,17 @@ export class DerivativesEngine {
     collateral: bigint;
     leverage: bigint;
   }): Position {
-    const market = this.getMarket(params.symbol);
+    const s = params.symbol.toUpperCase();
+    const market = this.markets.get(s);
+    if (!market) throw new Error(`Market ${s} is not registered`);
+
     if (!params.account || params.account.trim().length === 0) {
       throw new Error("Account address is required");
+    }
+
+    // Actor authorization boundary
+    if (params.caller && !this.isAuthorizedCaller(params.account, params.caller)) {
+      throw new Error(`Unauthorized: caller ${params.caller} is not authorized for account ${params.account}`);
     }
 
     const notional = calculateNotional(params.size, market.markPrice);
@@ -204,29 +244,96 @@ export class DerivativesEngine {
     };
 
     this.positions.set(positionId, position);
-    return position;
+    return { ...position };
   }
 
-  public settleFunding(symbol: string): { settledPositions: number; fundingRateBps: bigint } {
-    const market = this.getMarket(symbol);
+  /**
+   * Settles dynamic funding across all positions in a market.
+   * Enforces 8-hour elapsed duration and balances funding counterparties
+   * via the market insurance fund.
+   */
+  public settleFunding(
+    symbol: string,
+    currentTimestamp?: number
+  ): {
+    settledPositions: number;
+    fundingRateBps: bigint;
+    totalLongPayment: bigint;
+    totalShortPayment: bigint;
+    netImbalanceToInsuranceFund: bigint;
+    status: "SETTLED" | "SKIPPED_INTERVAL_NOT_ELAPSED";
+  } {
+    const s = symbol.toUpperCase();
+    const market = this.markets.get(s);
+    if (!market) throw new Error(`Market ${s} is not registered`);
+
+    const now = currentTimestamp ?? Date.now();
+    const elapsed = now - market.lastFundingSettledAt;
+
+    if (elapsed < FUNDING_INTERVAL_MS) {
+      return {
+        settledPositions: 0,
+        fundingRateBps: market.fundingRateBps,
+        totalLongPayment: 0n,
+        totalShortPayment: 0n,
+        netImbalanceToInsuranceFund: 0n,
+        status: "SKIPPED_INTERVAL_NOT_ELAPSED"
+      };
+    }
+
     let count = 0;
+    let totalLongPayment = 0n;
+    let totalShortPayment = 0n;
 
     for (const pos of this.positions.values()) {
       if (pos.marketSymbol === market.symbol) {
         const notional = calculateNotional(pos.size, market.markPrice);
         const payment = calculateFundingPayment(pos.isLong, notional, market.fundingRateBps);
         pos.accruedFunding += payment;
+        if (pos.isLong) {
+          totalLongPayment += payment;
+        } else {
+          totalShortPayment += payment;
+        }
         count++;
       }
     }
 
-    market.lastFundingSettledAt = Date.now();
-    return { settledPositions: count, fundingRateBps: market.fundingRateBps };
+    // Net funding imbalance: long payments + short payments (short payments are negative when receiving)
+    const netImbalance = totalLongPayment + totalShortPayment;
+    market.insuranceFundBalanceUsd += netImbalance;
+    market.lastFundingSettledAt = now;
+
+    return {
+      settledPositions: count,
+      fundingRateBps: market.fundingRateBps,
+      totalLongPayment,
+      totalShortPayment,
+      netImbalanceToInsuranceFund: netImbalance,
+      status: "SETTLED"
+    };
   }
 
-  public closePosition(positionId: string): SettlementReceipt {
-    const position = this.getPosition(positionId);
-    const market = this.getMarket(position.marketSymbol);
+  /**
+   * Closes an active position and returns net settlement receipt.
+   * Enforces authenticated actor authorization boundary.
+   */
+  public closePosition(params: {
+    caller: string;
+    positionId: string;
+  }): SettlementReceipt {
+    if (!params.caller || params.caller.trim().length === 0) {
+      throw new Error("Caller address is required for authorization");
+    }
+
+    const position = this.positions.get(params.positionId);
+    if (!position) throw new Error(`Position ${params.positionId} not found`);
+
+    if (!this.isAuthorizedCaller(position.account, params.caller)) {
+      throw new Error(`Unauthorized: caller ${params.caller} is not authorized to close position ${params.positionId}`);
+    }
+
+    const market = this.markets.get(position.marketSymbol)!;
 
     const realizedPnl = calculateUnrealizedPnl(
       position.isLong,
@@ -238,7 +345,7 @@ export class DerivativesEngine {
     const netEquity = position.collateral + realizedPnl - position.accruedFunding;
     const finalPayout = netEquity > 0n ? netEquity : 0n;
 
-    this.positions.delete(positionId);
+    this.positions.delete(params.positionId);
 
     return {
       positionId: position.id,
@@ -252,8 +359,10 @@ export class DerivativesEngine {
   }
 
   public liquidatePosition(positionId: string, liquidator: string): LiquidationReceipt {
-    const position = this.getPosition(positionId);
-    const market = this.getMarket(position.marketSymbol);
+    const position = this.positions.get(positionId);
+    if (!position) throw new Error(`Position ${positionId} not found`);
+
+    const market = this.markets.get(position.marketSymbol)!;
 
     if (!liquidator || liquidator.trim().length === 0) {
       throw new Error("Liquidator address is required");
@@ -279,28 +388,37 @@ export class DerivativesEngine {
     };
   }
 
+  /**
+   * Returns defensive copy of market state.
+   */
   public getMarket(symbol: string): MarketState {
     const s = symbol.toUpperCase();
     const market = this.markets.get(s);
     if (!market) throw new Error(`Market ${s} is not registered`);
-    return market;
+    return { ...market };
   }
 
+  /**
+   * Returns defensive copy of position state to prevent external reference corruption.
+   */
   public getPosition(positionId: string): Position {
     const pos = this.positions.get(positionId);
     if (!pos) throw new Error(`Position ${positionId} not found`);
-    return pos;
+    return { ...pos };
   }
 
   public getAccountPositions(account: string): Position[] {
-    return Array.from(this.positions.values()).filter(p => p.account.toLowerCase() === account.toLowerCase());
+    const acc = account.toLowerCase();
+    return Array.from(this.positions.values())
+      .filter(p => p.account.toLowerCase() === acc)
+      .map(p => ({ ...p }));
   }
 
   public listMarkets(): MarketState[] {
-    return Array.from(this.markets.values());
+    return Array.from(this.markets.values()).map(m => ({ ...m }));
   }
 
   public listPositions(): Position[] {
-    return Array.from(this.positions.values());
+    return Array.from(this.positions.values()).map(p => ({ ...p }));
   }
 }

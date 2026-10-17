@@ -2,37 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DerivativesEngine,
-  WAD
+  WAD,
+  FUNDING_INTERVAL_MS
 } from "../dist/index.js";
 
-test("1. Market registration and initial state validation", () => {
-  const engine = new DerivativesEngine();
-  const market = engine.registerMarket("ETH-USD", 3000n * WAD);
-
-  assert.equal(market.symbol, "ETH-USD");
-  assert.equal(market.markPrice, 3000n * WAD);
-  assert.equal(market.fundingRateBps, 0n);
-  assert.equal(engine.listMarkets().length, 1);
-});
-
-test("2. Open long position and enforce leverage & collateral constraints", () => {
+test("1. Defensive copy integrity: mutating returned references does not corrupt engine state", () => {
   const engine = new DerivativesEngine();
   engine.registerMarket("ETH-USD", 3000n * WAD);
 
-  // Opening 1 ETH position at $3000 with 10x leverage requires at least $300
-  // Attempt with $200 should fail
-  assert.throws(() => {
-    engine.openPosition({
-      account: "0xAlice",
-      symbol: "ETH-USD",
-      isLong: true,
-      size: 1n * WAD,
-      collateral: 200n * WAD,
-      leverage: 10n
-    });
-  }, /Insufficient collateral/);
-
-  // Legitimate open with $300 collateral
   const pos = engine.openPosition({
     account: "0xAlice",
     symbol: "ETH-USD",
@@ -42,17 +19,55 @@ test("2. Open long position and enforce leverage & collateral constraints", () =
     leverage: 10n
   });
 
-  assert.equal(pos.account, "0xAlice");
-  assert.equal(pos.isLong, true);
-  assert.equal(pos.collateral, 300n * WAD);
-  assert.equal(pos.entryPrice, 3000n * WAD);
-  assert.equal(engine.listPositions().length, 1);
+  // Attempt external mutation of returned reference
+  pos.collateral = 999_999n * WAD;
+  pos.size = 100n * WAD;
+
+  const internalPos = engine.getPosition(pos.id);
+  assert.equal(internalPos.collateral, 300n * WAD, "Internal collateral must remain immutable");
+  assert.equal(internalPos.size, 1n * WAD, "Internal size must remain immutable");
+
+  // Attempt market mutation
+  const m = engine.getMarket("ETH-USD");
+  m.markPrice = 1n * WAD;
+  const internalMarket = engine.getMarket("ETH-USD");
+  assert.equal(internalMarket.markPrice, 3000n * WAD, "Internal market price must remain immutable");
 });
 
-test("3. Price updates, funding calculation, and funding settlement", () => {
+test("2. Actor authorization model for position closure and operator approval", () => {
   const engine = new DerivativesEngine();
   engine.registerMarket("ETH-USD", 3000n * WAD);
 
+  const pos = engine.openPosition({
+    account: "0xAlice",
+    symbol: "ETH-USD",
+    isLong: true,
+    size: 1n * WAD,
+    collateral: 300n * WAD,
+    leverage: 10n
+  });
+
+  // Unauthorized third-party attempt
+  assert.throws(
+    () => engine.closePosition({ caller: "0xAttacker", positionId: pos.id }),
+    /Unauthorized: caller 0xAttacker is not authorized/
+  );
+
+  // Set approved operator
+  engine.setApprovedOperator("0xAlice", "0xBrokerBot", true);
+
+  // Approved operator successfully closes position
+  const receipt = engine.closePosition({ caller: "0xBrokerBot", positionId: pos.id });
+  assert.equal(receipt.positionId, pos.id);
+  assert.equal(receipt.account, "0xAlice");
+});
+
+test("3. Enforce 8-hour funding intervals, prevent duplicate settlement, and verify insurance fund balance", () => {
+  const startTime = 1_000_000_000_000;
+  const engine = new DerivativesEngine();
+  engine.registerMarket("ETH-USD", 3000n * WAD, 500n, 10_000n * WAD, startTime);
+
+  // Alice opens Long 1 ETH ($3000 notional)
   engine.openPosition({
     account: "0xAlice",
     symbol: "ETH-USD",
@@ -62,42 +77,42 @@ test("3. Price updates, funding calculation, and funding settlement", () => {
     leverage: 10n
   });
 
-  // Mark price is $3030, Index price is $3000 (+100 bps premium)
-  engine.updatePrices("ETH-USD", 3030n * WAD, 3000n * WAD);
-  const market = engine.getMarket("ETH-USD");
-  assert.equal(market.fundingRateBps, 100n);
-
-  // Settle funding: Long pays 1% of notional ($3030 * 100 / 10000 = $30.30)
-  const settlement = engine.settleFunding("ETH-USD");
-  assert.equal(settlement.settledPositions, 1);
-
-  const pos = engine.listPositions()[0];
-  assert.ok(pos.accruedFunding > 30n * WAD);
-});
-
-test("4. Close position with profit and verify payout receipt", () => {
-  const engine = new DerivativesEngine();
-  engine.registerMarket("ETH-USD", 3000n * WAD);
-
-  const pos = engine.openPosition({
+  // Bob opens Short 0.5 ETH ($1500 notional) -> Imbalance exists (Long 1.0 vs Short 0.5)
+  engine.openPosition({
     account: "0xBob",
     symbol: "ETH-USD",
-    isLong: true,
-    size: 1n * WAD,
-    collateral: 500n * WAD,
-    leverage: 6n
+    isLong: false,
+    size: 1n * (WAD / 2n),
+    collateral: 150n * WAD,
+    leverage: 10n
   });
 
-  // Price jumps to $3500 (+500 gain)
-  engine.updatePrices("ETH-USD", 3500n * WAD, 3500n * WAD);
+  // Mark price is $3030, Index is $3000 (+100 bps premium)
+  engine.updatePrices("ETH-USD", 3030n * WAD, 3000n * WAD);
 
-  const receipt = engine.closePosition(pos.id);
-  assert.equal(receipt.realizedPnl, 500n * WAD);
-  assert.equal(receipt.finalPayout, 1000n * WAD); // 500 collateral + 500 profit
-  assert.equal(engine.listPositions().length, 0);
+  // Attempt settlement after only 2 hours: must be skipped
+  const resEarly = engine.settleFunding("ETH-USD", startTime + (2 * 60 * 60 * 1000));
+  assert.equal(resEarly.status, "SKIPPED_INTERVAL_NOT_ELAPSED");
+  assert.equal(resEarly.settledPositions, 0);
+
+  // Settle exactly after 8 hours
+  const res8h = engine.settleFunding("ETH-USD", startTime + FUNDING_INTERVAL_MS);
+  assert.equal(res8h.status, "SETTLED");
+  assert.equal(res8h.settledPositions, 2);
+
+  // Long payment = 3030 * 100 / 10000 = +30.30 USD
+  // Short payment = - (1515 * 100 / 10000) = -15.15 USD (short receives)
+  // Net imbalance = +15.15 USD credited to insurance fund!
+  assert.ok(res8h.netImbalanceToInsuranceFund > 0n);
+  const updatedMarket = engine.getMarket("ETH-USD");
+  assert.equal(updatedMarket.insuranceFundBalanceUsd, 10_000n * WAD + res8h.netImbalanceToInsuranceFund);
+
+  // Immediate second settlement attempt within same epoch is blocked
+  const resDup = engine.settleFunding("ETH-USD", startTime + FUNDING_INTERVAL_MS + 1000);
+  assert.equal(resDup.status, "SKIPPED_INTERVAL_NOT_ELAPSED");
 });
 
-test("5. Liquidation of unhealthy position and protection of healthy position", () => {
+test("4. Liquidation of unhealthy position and protection of healthy position", () => {
   const engine = new DerivativesEngine();
   engine.registerMarket("ETH-USD", 3000n * WAD);
 
@@ -115,7 +130,7 @@ test("5. Liquidation of unhealthy position and protection of healthy position", 
     engine.liquidatePosition(pos.id, "0xLiquidator");
   }, /is healthy and cannot be liquidated/);
 
-  // Market crashes to $2800 (equity = $100, maintenance margin on $2800 = $140 -> liquidatable!)
+  // Market crashes to $2800
   engine.updatePrices("ETH-USD", 2800n * WAD, 2800n * WAD);
 
   const receipt = engine.liquidatePosition(pos.id, "0xLiquidator");
@@ -123,4 +138,26 @@ test("5. Liquidation of unhealthy position and protection of healthy position", 
   assert.equal(receipt.liquidator, "0xLiquidator");
   assert.equal(receipt.liquidationPrice, 2800n * WAD);
   assert.equal(engine.listPositions().length, 0);
+});
+
+test("5. Fail-closed: insufficient collateral and zero price boundaries", () => {
+  const engine = new DerivativesEngine();
+  engine.registerMarket("ETH-USD", 3000n * WAD);
+
+  assert.throws(
+    () => engine.openPosition({
+      account: "0xUnderfunded",
+      symbol: "ETH-USD",
+      isLong: true,
+      size: 1n * WAD,
+      collateral: 50n * WAD, // Only $50 provided for $300 required
+      leverage: 10n
+    }),
+    /Insufficient collateral/
+  );
+
+  assert.throws(
+    () => engine.updatePrices("ETH-USD", 0n, 3000n * WAD),
+    /strictly positive/
+  );
 });

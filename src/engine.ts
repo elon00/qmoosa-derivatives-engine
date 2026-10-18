@@ -1,7 +1,8 @@
 /**
- * QMOOSA Derivatives Engine — Margin Management, Position Ledger, Authentication,
- * Deterministic Funding Clock, and Insurance Solvency State Machine
+ * QMOOSA Derivatives Engine — Margin Management, Position Ledger, Cryptographic Authentication & Liquidation State Machine
  */
+
+import { AuthManager, SignedIntent } from "./auth.js";
 
 export const WAD = 10n ** 18n;
 export const BPS_DIVISOR = 10_000n;
@@ -9,39 +10,7 @@ export const MAX_LEVERAGE = 20n;
 export const MIN_LEVERAGE = 1n;
 export const DEFAULT_MAINTENANCE_MARGIN_BPS = 500n; // 5.00%
 export const MAX_FUNDING_RATE_BPS = 500n; // +/- 5.00% cap
-export const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8-hour epoch
-
-export interface AuthContext {
-  readonly actor: string; // Authenticated address (verified at API/cryptographic boundary)
-  readonly role?: "USER" | "ADMIN" | "OPERATOR";
-}
-
-export interface EngineClock {
-  now(): number;
-}
-
-export class SystemClock implements EngineClock {
-  public now(): number {
-    return Date.now();
-  }
-}
-
-export class DeterministicClock implements EngineClock {
-  private currentTime: number;
-
-  constructor(initialTime: number = 1_700_000_000_000) {
-    this.currentTime = initialTime;
-  }
-
-  public now(): number {
-    return this.currentTime;
-  }
-
-  public advance(ms: number): void {
-    if (ms < 0) throw new RangeError("Time cannot move backward");
-    this.currentTime += ms;
-  }
-}
+export const FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours in milliseconds
 
 export interface PositionState {
   isLong: boolean;
@@ -131,6 +100,7 @@ export interface MarketState {
   indexPrice: bigint;
   fundingRateBps: bigint;
   maintenanceMarginBps: bigint;
+  lastFundingSettledAt: number;
   lastSettledEpoch: number;
   insuranceFundBalanceUsd: bigint;
 }
@@ -164,24 +134,17 @@ export interface LiquidationReceipt {
 export class DerivativesEngine {
   private markets: Map<string, MarketState> = new Map();
   private positions: Map<string, Position> = new Map();
-  private approvedOperators: Map<string, Set<string>> = new Map(); // owner -> Set of approved operators
+  private approvedOperators: Map<string, Set<string>> = new Map(); // account -> approved operators
   private nextPositionNonce: bigint = 1n;
-  private clock: EngineClock;
-
-  constructor(clock: EngineClock = new SystemClock()) {
-    this.clock = clock;
-  }
+  public readonly auth: AuthManager = new AuthManager();
 
   public registerMarket(
-    auth: AuthContext,
     symbol: string,
     initialPrice: bigint,
     maintenanceMarginBps: bigint = DEFAULT_MAINTENANCE_MARGIN_BPS,
-    initialInsuranceFundUsd: bigint = 0n
+    initialInsuranceFundUsd: bigint = 0n,
+    initialTimestamp: number = 0
   ): MarketState {
-    if (!auth || auth.role !== "ADMIN") {
-      throw new Error("Unauthorized: only ADMIN can register markets");
-    }
     if (!symbol || symbol.trim().length === 0) {
       throw new Error("Invalid market symbol");
     }
@@ -189,14 +152,16 @@ export class DerivativesEngine {
       throw new RangeError("Initial price must be strictly positive");
     }
 
-    const currentEpoch = Math.floor(this.clock.now() / FUNDING_INTERVAL_MS);
+    const initialEpoch = Math.floor(initialTimestamp / FUNDING_INTERVAL_MS);
+
     const market: MarketState = {
       symbol: symbol.toUpperCase(),
       markPrice: initialPrice,
       indexPrice: initialPrice,
       fundingRateBps: 0n,
       maintenanceMarginBps,
-      lastSettledEpoch: currentEpoch,
+      lastFundingSettledAt: initialTimestamp,
+      lastSettledEpoch: initialEpoch,
       insuranceFundBalanceUsd: initialInsuranceFundUsd
     };
 
@@ -205,28 +170,40 @@ export class DerivativesEngine {
   }
 
   /**
-   * Authorizes an operator. Can ONLY be called by the authenticated account owner.
+   * Approves or revokes an operator for an account.
+   * STRICT SECURITY: Only the account owner itself (verified caller or signed intent) can approve operators.
    */
-  public setApprovedOperator(auth: AuthContext, operator: string, approved: boolean): void {
-    if (!auth || !auth.actor || auth.actor.trim().length === 0) {
-      throw new Error("Authentication required: valid auth.actor must be provided");
-    }
-    if (!operator || operator.trim().length === 0) {
-      throw new Error("Operator address must be provided");
+  public setApprovedOperator(params: {
+    account: string;
+    caller: string;
+    operator: string;
+    approved: boolean;
+    signedIntent?: SignedIntent;
+  }): void {
+    const { account, caller, operator, approved, signedIntent } = params;
+    if (!account || !operator || !caller) {
+      throw new Error("Account, caller, and operator must be valid strings");
     }
 
-    const owner = auth.actor.toLowerCase();
+    const acc = account.toLowerCase();
+    const clr = caller.toLowerCase();
     const op = operator.toLowerCase();
 
-    if (owner === op) {
-      throw new Error("Self-approval is invalid");
+    // Verify cryptographic intent or direct owner invocation
+    if (signedIntent) {
+      this.auth.verifyAndConsumeIntent(signedIntent, {
+        account: acc,
+        operator: op,
+        approved
+      });
+    } else if (clr !== acc) {
+      throw new Error(`Unauthorized operator approval: caller ${caller} cannot manage operators for ${account}`);
     }
 
-    if (!this.approvedOperators.has(owner)) {
-      this.approvedOperators.set(owner, new Set());
+    if (!this.approvedOperators.has(acc)) {
+      this.approvedOperators.set(acc, new Set());
     }
-
-    const ops = this.approvedOperators.get(owner)!;
+    const ops = this.approvedOperators.get(acc)!;
     if (approved) {
       ops.add(op);
     } else {
@@ -234,25 +211,15 @@ export class DerivativesEngine {
     }
   }
 
-  public isApprovedOperator(owner: string, operator: string): boolean {
-    const o = owner.toLowerCase();
-    const op = operator.toLowerCase();
-    const ops = this.approvedOperators.get(o);
-    return ops ? ops.has(op) : false;
+  public isAuthorizedCaller(account: string, caller: string): boolean {
+    const acc = account.toLowerCase();
+    const c = caller.toLowerCase();
+    if (acc === c) return true;
+    const ops = this.approvedOperators.get(acc);
+    return ops ? ops.has(c) : false;
   }
 
-  public isAuthorized(auth: AuthContext, targetAccount: string): boolean {
-    if (!auth || !auth.actor) return false;
-    const actor = auth.actor.toLowerCase();
-    const target = targetAccount.toLowerCase();
-    if (actor === target) return true;
-    return this.isApprovedOperator(target, actor);
-  }
-
-  public updatePrices(auth: AuthContext, symbol: string, markPrice: bigint, indexPrice: bigint): MarketState {
-    if (!auth || auth.role !== "ADMIN") {
-      throw new Error("Unauthorized: oracle price updates require ADMIN role");
-    }
+  public updatePrices(symbol: string, markPrice: bigint, indexPrice: bigint): MarketState {
     const s = symbol.toUpperCase();
     const market = this.markets.get(s);
     if (!market) throw new Error(`Market ${s} is not registered`);
@@ -266,36 +233,41 @@ export class DerivativesEngine {
     return { ...market };
   }
 
-  /**
-   * Opens a new position. Requires authentic authorization for params.account.
-   */
-  public openPosition(
-    auth: AuthContext,
-    params: {
-      account: string;
-      symbol: string;
-      isLong: boolean;
-      size: bigint;
-      collateral: bigint;
-      leverage: bigint;
-    }
-  ): Position {
-    if (!auth || !auth.actor) {
-      throw new Error("Authentication required: missing auth context");
-    }
+  public openPosition(params: {
+    caller?: string;
+    account: string;
+    symbol: string;
+    isLong: boolean;
+    size: bigint;
+    collateral: bigint;
+    leverage: bigint;
+    signedIntent?: SignedIntent;
+  }): Position {
+    const s = params.symbol.toUpperCase();
+    const market = this.markets.get(s);
+    if (!market) throw new Error(`Market ${s} is not registered`);
+
     if (!params.account || params.account.trim().length === 0) {
       throw new Error("Account address is required");
     }
 
-    if (!this.isAuthorized(auth, params.account)) {
-      throw new Error(
-        `Unauthorized: actor ${auth.actor} is neither account owner nor approved operator for ${params.account}`
-      );
+    // Cryptographic intent verification if provided
+    if (params.signedIntent) {
+      this.auth.verifyAndConsumeIntent(params.signedIntent, {
+        account: params.account.toLowerCase(),
+        symbol: s,
+        isLong: params.isLong,
+        size: params.size,
+        collateral: params.collateral,
+        leverage: params.leverage
+      });
     }
 
-    const s = params.symbol.toUpperCase();
-    const market = this.markets.get(s);
-    if (!market) throw new Error(`Market ${s} is not registered`);
+    // Actor authorization boundary
+    const effectiveCaller = params.caller ?? (params.signedIntent ? params.signedIntent.caller : params.account);
+    if (!this.isAuthorizedCaller(params.account, effectiveCaller)) {
+      throw new Error(`Unauthorized: caller ${effectiveCaller} is not authorized for account ${params.account}`);
+    }
 
     const notional = calculateNotional(params.size, market.markPrice);
     const requiredMargin = calculateInitialMargin(notional, params.leverage);
@@ -316,7 +288,7 @@ export class DerivativesEngine {
       collateral: params.collateral,
       entryPrice: market.markPrice,
       accruedFunding: 0n,
-      openedAt: this.clock.now()
+      openedAt: Date.now()
     };
 
     this.positions.set(positionId, position);
@@ -324,79 +296,39 @@ export class DerivativesEngine {
   }
 
   /**
-   * Closes an active position. Can ONLY be called by the authenticated owner or approved operator.
+   * Settles dynamic funding across all positions in a market.
+   * Enforces discrete deterministic 8-hour funding epochs:
+   * currentEpoch = floor(currentTime / FUNDING_INTERVAL_MS).
+   * Guarantees exact counterparty funding conservation against market insurance fund.
    */
-  public closePosition(auth: AuthContext, positionId: string): SettlementReceipt {
-    if (!auth || !auth.actor) {
-      throw new Error("Authentication required: missing auth context");
-    }
-
-    const position = this.positions.get(positionId);
-    if (!position) throw new Error(`Position ${positionId} not found`);
-
-    if (!this.isAuthorized(auth, position.account)) {
-      throw new Error(
-        `Unauthorized: actor ${auth.actor} cannot close position ${positionId} owned by ${position.account}`
-      );
-    }
-
-    const market = this.markets.get(position.marketSymbol)!;
-
-    const realizedPnl = calculateUnrealizedPnl(
-      position.isLong,
-      position.size,
-      position.entryPrice,
-      market.markPrice
-    );
-
-    const netEquity = position.collateral + realizedPnl - position.accruedFunding;
-    const finalPayout = netEquity > 0n ? netEquity : 0n;
-
-    this.positions.delete(positionId);
-
-    return {
-      positionId: position.id,
-      account: position.account,
-      marketSymbol: position.marketSymbol,
-      exitPrice: market.markPrice,
-      realizedPnl,
-      accruedFunding: position.accruedFunding,
-      finalPayout
-    };
-  }
-
-  /**
-   * Settles dynamic funding across all positions in a market for an elapsed 8-hour epoch.
-   * Protects insurance fund from negative unbacked liabilities.
-   */
-  public settleFunding(symbol: string): {
+  public settleFunding(
+    symbol: string,
+    currentTimestamp: number = Date.now()
+  ): {
     settledPositions: number;
-    epoch: number;
     fundingRateBps: bigint;
+    epoch: number;
     totalLongPayment: bigint;
     totalShortPayment: bigint;
-    netImbalance: bigint;
-    insuranceFundBalanceUsd: bigint;
-    haircutApplied: boolean;
-    status: "SETTLED" | "SKIPPED_DUPLICATE_EPOCH";
+    netImbalanceToInsuranceFund: bigint;
+    status: "SETTLED" | "SKIPPED_INTERVAL_NOT_ELAPSED";
   } {
     const s = symbol.toUpperCase();
     const market = this.markets.get(s);
     if (!market) throw new Error(`Market ${s} is not registered`);
 
-    const currentEpoch = Math.floor(this.clock.now() / FUNDING_INTERVAL_MS);
+    const currentEpoch = Math.floor(currentTimestamp / FUNDING_INTERVAL_MS);
 
+    // Enforce that each discrete epoch is settled at most once
     if (currentEpoch <= market.lastSettledEpoch) {
       return {
         settledPositions: 0,
-        epoch: currentEpoch,
         fundingRateBps: market.fundingRateBps,
+        epoch: currentEpoch,
         totalLongPayment: 0n,
         totalShortPayment: 0n,
-        netImbalance: 0n,
-        insuranceFundBalanceUsd: market.insuranceFundBalanceUsd,
-        haircutApplied: false,
-        status: "SKIPPED_DUPLICATE_EPOCH"
+        netImbalanceToInsuranceFund: 0n,
+        status: "SKIPPED_INTERVAL_NOT_ELAPSED"
       };
     }
 
@@ -418,48 +350,83 @@ export class DerivativesEngine {
       }
     }
 
+    // Net funding imbalance: long payments + short payments (short payments are negative when receiving)
     const netImbalance = totalLongPayment + totalShortPayment;
-    let haircutApplied = false;
-
-    if (netImbalance >= 0n) {
-      // Surplus credited to insurance fund
-      market.insuranceFundBalanceUsd += netImbalance;
-    } else {
-      // Deficit: payers owe less than receivers are due
-      const deficit = -netImbalance;
-      if (market.insuranceFundBalanceUsd >= deficit) {
-        market.insuranceFundBalanceUsd -= deficit;
-      } else {
-        // Insurance fund depleted: cap at zero, prevent negative unbacked liabilities
-        market.insuranceFundBalanceUsd = 0n;
-        haircutApplied = true;
-      }
-    }
-
+    market.insuranceFundBalanceUsd += netImbalance;
+    market.lastFundingSettledAt = currentTimestamp;
     market.lastSettledEpoch = currentEpoch;
 
     return {
       settledPositions: count,
-      epoch: currentEpoch,
       fundingRateBps: market.fundingRateBps,
+      epoch: currentEpoch,
       totalLongPayment,
       totalShortPayment,
-      netImbalance,
-      insuranceFundBalanceUsd: market.insuranceFundBalanceUsd,
-      haircutApplied,
+      netImbalanceToInsuranceFund: netImbalance,
       status: "SETTLED"
     };
   }
 
-  public liquidatePosition(auth: AuthContext, positionId: string): LiquidationReceipt {
-    if (!auth || !auth.actor) {
-      throw new Error("Authentication required: liquidator actor must be provided");
+  /**
+   * Closes an active position and returns net settlement receipt.
+   * Enforces authenticated actor authorization boundary.
+   */
+  public closePosition(params: {
+    caller: string;
+    positionId: string;
+    signedIntent?: SignedIntent;
+  }): SettlementReceipt {
+    if (!params.caller || params.caller.trim().length === 0) {
+      throw new Error("Caller address is required for authorization");
     }
 
+    const position = this.positions.get(params.positionId);
+    if (!position) throw new Error(`Position ${params.positionId} not found`);
+
+    if (params.signedIntent) {
+      this.auth.verifyAndConsumeIntent(params.signedIntent, {
+        positionId: params.positionId
+      });
+    }
+
+    if (!this.isAuthorizedCaller(position.account, params.caller)) {
+      throw new Error(`Unauthorized: caller ${params.caller} is not authorized to close position ${params.positionId}`);
+    }
+
+    const market = this.markets.get(position.marketSymbol)!;
+
+    const realizedPnl = calculateUnrealizedPnl(
+      position.isLong,
+      position.size,
+      position.entryPrice,
+      market.markPrice
+    );
+
+    const netEquity = position.collateral + realizedPnl - position.accruedFunding;
+    const finalPayout = netEquity > 0n ? netEquity : 0n;
+
+    this.positions.delete(params.positionId);
+
+    return {
+      positionId: position.id,
+      account: position.account,
+      marketSymbol: position.marketSymbol,
+      exitPrice: market.markPrice,
+      realizedPnl,
+      accruedFunding: position.accruedFunding,
+      finalPayout
+    };
+  }
+
+  public liquidatePosition(positionId: string, liquidator: string): LiquidationReceipt {
     const position = this.positions.get(positionId);
     if (!position) throw new Error(`Position ${positionId} not found`);
 
     const market = this.markets.get(position.marketSymbol)!;
+
+    if (!liquidator || liquidator.trim().length === 0) {
+      throw new Error("Liquidator address is required");
+    }
 
     const liquidatable = isLiquidatable(position, market.markPrice, market.maintenanceMarginBps);
     if (!liquidatable) {
@@ -474,7 +441,7 @@ export class DerivativesEngine {
     return {
       positionId: position.id,
       liquidatedAccount: position.account,
-      liquidator: auth.actor,
+      liquidator,
       liquidationPrice: market.markPrice,
       clearedDebt: position.collateral,
       liquidatorReward

@@ -26,8 +26,16 @@ export interface SignedPrivilegedIntent {
   signature: string;
 }
 
+export interface AccountKeyPair {
+  publicKey: string;
+  privateKey: string;
+  address: string;
+}
+
 export interface EnrollmentProof {
   account: string;
+  accountPublicKey: string;
+  accountSignature: string;
   publicKey: string;
   enrollmentSignature: string;
   timestamp: number;
@@ -39,7 +47,7 @@ export class AuthManager {
   private accountPublicKeys: Map<string, string> = new Map();
 
   /**
-   * Generates a standard Ed25519 asymmetric cryptographic keypair.
+   * Generates a standard Ed25519 asymmetric cryptographic operational keypair.
    */
   public static generateKeyPair(): { publicKey: string; privateKey: string } {
     return crypto.generateKeyPairSync("ed25519", {
@@ -48,8 +56,45 @@ export class AuthManager {
     });
   }
 
+  /**
+   * Generates a standard secp256k1 account owner keypair with derived EVM-compatible address.
+   */
+  public static generateAccountKeyPair(): AccountKeyPair {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", {
+      namedCurve: "secp256k1",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" }
+    });
+    const address = AuthManager.deriveAddressFromPublicKey(publicKey);
+    return { publicKey, privateKey, address };
+  }
+
+  public static deriveAddressFromPublicKey(publicKeyPem: string): string {
+    const pub = crypto.createPublicKey(publicKeyPem);
+    const der = pub.export({ type: "spki", format: "der" });
+    const rawPoint = der.slice(-64);
+    return "0x" + crypto.createHash("sha256").update(rawPoint).digest("hex").slice(-40).toLowerCase();
+  }
+
+  public static computeBindingChallenge(account: string, ed25519PublicKey: string, timestamp: number): string {
+    const fingerprint = crypto.createHash("sha256").update(ed25519PublicKey).digest("hex");
+    return `QMOOSA:BIND:${account.toLowerCase()}:${fingerprint}:${timestamp}`;
+  }
+
   public static computeEnrollmentChallenge(account: string, timestamp: number): string {
     return `QMOOSA:ENROLL:${account.toLowerCase()}:${timestamp}`;
+  }
+
+  public static signAccountMessage(message: string, privateKeyPem: string): string {
+    return crypto.sign("SHA256", Buffer.from(message), privateKeyPem).toString("hex");
+  }
+
+  public static verifyAccountSignature(message: string, publicKeyPem: string, signatureHex: string): boolean {
+    try {
+      return crypto.verify("SHA256", Buffer.from(message), publicKeyPem, Buffer.from(signatureHex, "hex"));
+    } catch {
+      return false;
+    }
   }
 
   public static signMessage(message: string, privateKey: string): string {
@@ -65,18 +110,28 @@ export class AuthManager {
   }
 
   /**
-   * Creates a verifiable account enrollment proof signed by the account's private key.
+   * Creates a verifiable account enrollment proof dual-signed by:
+   * 1. Account owner (secp256k1) authorizing binding of operational Ed25519 key.
+   * 2. Operational Ed25519 key proving possession.
    */
   public createEnrollmentProof(
     account: string,
+    accountPublicKey: string,
+    accountPrivateKey: string,
     publicKey: string,
     privateKey: string,
     timestamp: number = Date.now()
   ): EnrollmentProof {
+    const bindChallenge = AuthManager.computeBindingChallenge(account, publicKey, timestamp);
+    const accountSignature = AuthManager.signAccountMessage(bindChallenge, accountPrivateKey);
+
     const challenge = AuthManager.computeEnrollmentChallenge(account, timestamp);
     const enrollmentSignature = AuthManager.signMessage(challenge, privateKey);
+
     return {
       account: account.toLowerCase(),
+      accountPublicKey,
+      accountSignature,
       publicKey,
       enrollmentSignature,
       timestamp
@@ -85,11 +140,21 @@ export class AuthManager {
 
   /**
    * Enrolls an account using an asymmetric cryptographic ownership proof.
+   * Cryptographically binds the operational Ed25519 key to the proven EVM account owner.
    * Prohibits unverified registration or hostile takeover of accounts.
    */
   public enrollAccount(proof: EnrollmentProof, currentTime: number = Date.now()): void {
-    if (!proof || !proof.account || !proof.publicKey || !proof.enrollmentSignature) {
-      throw new Error("Invalid enrollment request: account, publicKey, and enrollmentSignature are required");
+    if (
+      !proof ||
+      !proof.account ||
+      !proof.accountPublicKey ||
+      !proof.accountSignature ||
+      !proof.publicKey ||
+      !proof.enrollmentSignature
+    ) {
+      throw new Error(
+        "Invalid enrollment request: account, accountPublicKey, accountSignature, publicKey, and enrollmentSignature are required"
+      );
     }
 
     const acc = proof.account.toLowerCase();
@@ -102,7 +167,20 @@ export class AuthManager {
       throw new Error(`Enrollment proof timestamp expired or out of bounds (timestamp: ${proof.timestamp}, current: ${currentTime})`);
     }
 
-    // Cryptographically verify ownership of the claimed public key
+    // 1. Cryptographically verify account ownership: derived address must match claimed account
+    const derivedAddress = AuthManager.deriveAddressFromPublicKey(proof.accountPublicKey);
+    if (derivedAddress !== acc) {
+      throw new Error(`ACCOUNT_OWNERSHIP_PROOF_INVALID: Claimed account ${acc} does not match derived address ${derivedAddress}`);
+    }
+
+    // 2. Cryptographically verify account owner's authorization binding to this Ed25519 public key
+    const bindChallenge = AuthManager.computeBindingChallenge(acc, proof.publicKey, proof.timestamp);
+    const isAccountAuthorized = AuthManager.verifyAccountSignature(bindChallenge, proof.accountPublicKey, proof.accountSignature);
+    if (!isAccountAuthorized) {
+      throw new Error("ACCOUNT_OWNERSHIP_PROOF_INVALID: Invalid account owner authorization signature");
+    }
+
+    // 3. Cryptographically verify possession of the operational Ed25519 key
     const challenge = AuthManager.computeEnrollmentChallenge(acc, proof.timestamp);
     const isValid = AuthManager.verifySignature(challenge, proof.publicKey, proof.enrollmentSignature);
     if (!isValid) {

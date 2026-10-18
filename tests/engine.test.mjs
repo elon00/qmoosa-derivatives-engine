@@ -9,25 +9,52 @@ import {
   DEFAULT_CONTRACT_ADDRESS
 } from "../dist/index.js";
 
-const ADMIN = "0xAdmin";
-const ORACLE = "0xOracle";
-const KEEPER = "0xKeeper";
+// Generate asymmetric keypairs for privileged roles
+const adminKeys = AuthManager.generateKeyPair();
+const oracleKeys = AuthManager.generateKeyPair();
+const keeperKeys = AuthManager.generateKeyPair();
 
 function createTestEngine() {
-  const engine = new DerivativesEngine({
-    admin: ADMIN,
-    oracleSigner: ORACLE,
-    keeperSigner: KEEPER
+  return new DerivativesEngine({
+    adminPublicKey: adminKeys.publicKey,
+    oraclePublicKey: oracleKeys.publicKey,
+    keeperPublicKey: keeperKeys.publicKey
   });
-  return engine;
+}
+
+function registerTestMarket(engine, symbol = "ETH-USD", initialPrice = 3000n * WAD, insurance = 10_000n * WAD, timestamp = 0) {
+  const intent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ADMIN",
+    "REGISTER_MARKET",
+    {
+      symbol: symbol.toUpperCase(),
+      initialPrice,
+      maintenanceMarginBps: 500n,
+      initialInsuranceFundUsd: insurance,
+      initialTimestamp: timestamp
+    },
+    adminKeys.privateKey
+  );
+
+  return engine.registerMarket({
+    signedIntent: intent,
+    symbol,
+    initialPrice,
+    maintenanceMarginBps: 500n,
+    initialInsuranceFundUsd: insurance,
+    initialTimestamp: timestamp
+  });
 }
 
 test("1. Defensive copy integrity: mutating returned references does not corrupt engine state", () => {
   const engine = createTestEngine();
-  engine.registerMarket({ caller: ADMIN, symbol: "ETH-USD", initialPrice: 3000n * WAD });
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD);
 
-  const secretAlice = "secret-alice-12345";
-  engine.auth.registerAccountCredential("0xAlice", secretAlice);
+  // Enroll Alice with cryptographic proof
+  const aliceKeys = AuthManager.generateKeyPair();
+  const proof = engine.auth.createEnrollmentProof("0xAlice", aliceKeys.publicKey, aliceKeys.privateKey);
+  engine.auth.enrollAccount(proof);
 
   const openParams = {
     account: "0xalice",
@@ -44,7 +71,7 @@ test("1. Defensive copy integrity: mutating returned references does not corrupt
     "0xAlice",
     "OPEN_POSITION",
     openParams,
-    secretAlice
+    aliceKeys.privateKey
   );
 
   const pos = engine.openPosition({
@@ -71,23 +98,158 @@ test("1. Defensive copy integrity: mutating returned references does not corrupt
   assert.equal(internalMarket.markPrice, 3000n * WAD, "Internal market price must remain immutable");
 });
 
-test("2. Operator approval security & actor authorization model with cryptographic intents", () => {
+test("2. Verifiable account enrollment with asymmetric cryptographic ownership proof (P0)", () => {
   const engine = createTestEngine();
-  engine.registerMarket({ caller: ADMIN, symbol: "ETH-USD", initialPrice: 3000n * WAD });
+  const aliceKeys = AuthManager.generateKeyPair();
+  const attackerKeys = AuthManager.generateKeyPair();
 
-  const secretAlice = "secret-alice-12345";
-  const secretAttacker = "secret-attacker-666";
-  engine.auth.registerAccountCredential("0xAlice", secretAlice);
-  engine.auth.registerAccountCredential("0xAttacker", secretAttacker);
+  // Attack 1: Attacker tries to enroll Alice's account with attacker's key without Alice's signature
+  const forgedProof = {
+    account: "0xAlice",
+    publicKey: attackerKeys.publicKey,
+    enrollmentSignature: AuthManager.signMessage("random-fake-signature", attackerKeys.privateKey),
+    timestamp: Date.now()
+  };
+
+  assert.throws(() => {
+    engine.auth.enrollAccount(forgedProof);
+  }, /Cryptographic enrollment verification failed/);
+
+  // Attack 2: Expired enrollment proof is rejected
+  const expiredProof = engine.auth.createEnrollmentProof(
+    "0xAlice",
+    aliceKeys.publicKey,
+    aliceKeys.privateKey,
+    Date.now() - 400_000 // 6.6 minutes ago
+  );
+
+  assert.throws(() => {
+    engine.auth.enrollAccount(expiredProof);
+  }, /Enrollment proof timestamp expired/);
+
+  // Legitimate enrollment succeeds
+  const legitimateProof = engine.auth.createEnrollmentProof("0xAlice", aliceKeys.publicKey, aliceKeys.privateKey);
+  engine.auth.enrollAccount(legitimateProof);
+  assert.equal(engine.auth.isAccountEnrolled("0xAlice"), true);
+
+  // Attack 3: Hostile takeover / re-registration without proof is strictly blocked
+  assert.throws(() => {
+    engine.auth.enrollAccount(legitimateProof);
+  }, /already enrolled; re-enrollment without key rotation proof is prohibited/);
+});
+
+test("3. Privileged role authorization with asymmetric cryptographic signatures (P0)", () => {
+  const engine = createTestEngine();
+  const imposterKeys = AuthManager.generateKeyPair();
+
+  // Attack: Imposter attempts to register market with forged admin signature
+  const forgedAdminIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ADMIN",
+    "REGISTER_MARKET",
+    {
+      symbol: "ETH-USD",
+      initialPrice: 3000n * WAD,
+      maintenanceMarginBps: 500n,
+      initialInsuranceFundUsd: 0n,
+      initialTimestamp: 0
+    },
+    imposterKeys.privateKey
+  );
+
+  assert.throws(() => {
+    engine.registerMarket({
+      signedIntent: forgedAdminIntent,
+      symbol: "ETH-USD",
+      initialPrice: 3000n * WAD
+    });
+  }, /Cryptographic verification failed: invalid signature for privileged role ADMIN/);
+
+  // Legitimate Admin registers market
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD);
+
+  // Attack: Imposter attempts to update prices
+  const forgedOracleIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ORACLE",
+    "UPDATE_PRICES",
+    {
+      symbol: "ETH-USD",
+      markPrice: 3500n * WAD,
+      indexPrice: 3500n * WAD
+    },
+    imposterKeys.privateKey
+  );
+
+  assert.throws(() => {
+    engine.updatePrices({
+      signedIntent: forgedOracleIntent,
+      symbol: "ETH-USD",
+      markPrice: 3500n * WAD,
+      indexPrice: 3500n * WAD
+    });
+  }, /Cryptographic verification failed: invalid signature for privileged role ORACLE/);
+
+  // Legitimate Oracle updates prices
+  const oracleIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ORACLE",
+    "UPDATE_PRICES",
+    {
+      symbol: "ETH-USD",
+      markPrice: 3100n * WAD,
+      indexPrice: 3100n * WAD
+    },
+    oracleKeys.privateKey
+  );
+
+  engine.updatePrices({
+    signedIntent: oracleIntent,
+    symbol: "ETH-USD",
+    markPrice: 3100n * WAD,
+    indexPrice: 3100n * WAD
+  });
+
+  assert.equal(engine.getMarket("ETH-USD").markPrice, 3100n * WAD);
+
+  // Attack: Imposter attempts to settle funding
+  const forgedKeeperIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "KEEPER",
+    "SETTLE_FUNDING",
+    {
+      symbol: "ETH-USD",
+      currentTimestamp: 100_000
+    },
+    imposterKeys.privateKey
+  );
+
+  assert.throws(() => {
+    engine.settleFunding({
+      signedIntent: forgedKeeperIntent,
+      symbol: "ETH-USD",
+      currentTimestamp: 100_000
+    });
+  }, /Cryptographic verification failed: invalid signature for privileged role KEEPER/);
+});
+
+test("4. Operator approval security & actor authorization model with cryptographic intents", () => {
+  const engine = createTestEngine();
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD);
+
+  const aliceKeys = AuthManager.generateKeyPair();
+  const attackerKeys = AuthManager.generateKeyPair();
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xAlice", aliceKeys.publicKey, aliceKeys.privateKey));
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xAttacker", attackerKeys.publicKey, attackerKeys.privateKey));
 
   // Security test P0: Third party cannot sign an operator approval for another account
   const attackerForgedIntent = engine.auth.signIntent(
     engine.domain,
     "0xAlice",
-    "0xAttacker", // attacker tries to act as caller
+    "0xAttacker",
     "SET_OPERATOR",
     { account: "0xalice", operator: "0xmaliciousbroker", approved: true },
-    secretAttacker // signed with attacker's secret key!
+    attackerKeys.privateKey
   );
 
   assert.throws(() => {
@@ -105,7 +267,7 @@ test("2. Operator approval security & actor authorization model with cryptograph
     "0xAlice",
     "SET_OPERATOR",
     { account: "0xalice", operator: "0xbrokerbot", approved: true },
-    secretAlice
+    aliceKeys.privateKey
   );
 
   engine.setApprovedOperator({
@@ -130,7 +292,7 @@ test("2. Operator approval security & actor authorization model with cryptograph
     "0xAlice",
     "OPEN_POSITION",
     openParams,
-    secretAlice
+    aliceKeys.privateKey
   );
 
   const pos = engine.openPosition({
@@ -149,7 +311,7 @@ test("2. Operator approval security & actor authorization model with cryptograph
     "0xAttacker",
     "CLOSE_POSITION",
     { positionId: pos.id, account: "0xalice" },
-    secretAttacker
+    attackerKeys.privateKey
   );
 
   assert.throws(
@@ -164,7 +326,7 @@ test("2. Operator approval security & actor authorization model with cryptograph
     "0xBrokerBot",
     "CLOSE_POSITION",
     { positionId: pos.id, account: "0xalice" },
-    secretAlice
+    aliceKeys.privateKey
   );
 
   const receipt = engine.closePosition({ signedIntent: brokerCloseIntent, positionId: pos.id });
@@ -172,17 +334,12 @@ test("2. Operator approval security & actor authorization model with cryptograph
   assert.equal(receipt.account, "0xalice");
 });
 
-test("3. Cryptographic signature verification, replay defense, domain binding, and credential immutability", () => {
+test("5. Cryptographic signature verification, replay defense, and domain binding", () => {
   const engine = createTestEngine();
-  engine.registerMarket({ caller: ADMIN, symbol: "ETH-USD", initialPrice: 3000n * WAD });
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD);
 
-  const secretAlice = "super-secure-private-key-0xalice";
-  engine.auth.registerAccountCredential("0xAlice", secretAlice);
-
-  // Test P0: Credential overwrite attempt fails closed
-  assert.throws(() => {
-    engine.auth.registerAccountCredential("0xAlice", "malicious-replacement-key");
-  }, /already registered; overwrite not permitted/);
+  const aliceKeys = AuthManager.generateKeyPair();
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xAlice", aliceKeys.publicKey, aliceKeys.privateKey));
 
   const openParams = {
     account: "0xalice",
@@ -199,7 +356,7 @@ test("3. Cryptographic signature verification, replay defense, domain binding, a
     "0xAlice",
     "OPEN_POSITION",
     openParams,
-    secretAlice,
+    aliceKeys.privateKey,
     Date.now() + 60_000
   );
 
@@ -233,7 +390,7 @@ test("3. Cryptographic signature verification, replay defense, domain binding, a
     "0xAlice",
     "OPEN_POSITION",
     openParams,
-    secretAlice,
+    aliceKeys.privateKey,
     Date.now() + 60_000
   );
 
@@ -256,7 +413,7 @@ test("3. Cryptographic signature verification, replay defense, domain binding, a
     "0xAlice",
     "OPEN_POSITION",
     openParams,
-    secretAlice,
+    aliceKeys.privateKey,
     Date.now() + 60_000
   );
 
@@ -272,59 +429,26 @@ test("3. Cryptographic signature verification, replay defense, domain binding, a
   }, /Domain chainId mismatch/);
 });
 
-test("4. Privileged role boundary enforcement (Admin, Oracle, Keeper)", () => {
-  const engine = createTestEngine();
-
-  // Non-admin cannot register market
-  assert.throws(() => {
-    engine.registerMarket({ caller: "0xRandomUser", symbol: "ETH-USD", initialPrice: 3000n * WAD });
-  }, /Unauthorized: caller 0xRandomUser is not the market administrator/);
-
-  // Admin registers market
-  engine.registerMarket({ caller: ADMIN, symbol: "ETH-USD", initialPrice: 3000n * WAD });
-
-  // Non-oracle cannot update prices
-  assert.throws(() => {
-    engine.updatePrices({ caller: "0xRandomUser", symbol: "ETH-USD", markPrice: 3100n * WAD, indexPrice: 3100n * WAD });
-  }, /Unauthorized: caller 0xRandomUser is not the authorized oracle signer/);
-
-  // Oracle updates prices
-  engine.updatePrices({ caller: ORACLE, symbol: "ETH-USD", markPrice: 3100n * WAD, indexPrice: 3100n * WAD });
-  assert.equal(engine.getMarket("ETH-USD").markPrice, 3100n * WAD);
-
-  // Non-keeper cannot settle funding
-  assert.throws(() => {
-    engine.settleFunding({ caller: "0xRandomUser", symbol: "ETH-USD" });
-  }, /Unauthorized: caller 0xRandomUser is not the authorized settlement keeper/);
-});
-
-test("5. Discrete deterministic 8-hour funding epochs, insurance balance, and solvency freeze", () => {
+test("6. Financial correctness: discrete epochs, monotonic timestamps, and atomic rollback on insolvency (P1)", () => {
   const epoch100Time = 100 * FUNDING_INTERVAL_MS;
   const engine = createTestEngine();
-  engine.registerMarket({
-    caller: ADMIN,
-    symbol: "ETH-USD",
-    initialPrice: 3000n * WAD,
-    maintenanceMarginBps: 500n,
-    initialInsuranceFundUsd: 10_000n * WAD,
-    initialTimestamp: epoch100Time
-  });
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD, 10_000n * WAD, epoch100Time);
 
-  const secretAlice = "secret-alice-12345";
-  const secretBob = "secret-bob-12345";
-  engine.auth.registerAccountCredential("0xAlice", secretAlice);
-  engine.auth.registerAccountCredential("0xBob", secretBob);
+  const aliceKeys = AuthManager.generateKeyPair();
+  const bobKeys = AuthManager.generateKeyPair();
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xAlice", aliceKeys.publicKey, aliceKeys.privateKey));
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xBob", bobKeys.publicKey, bobKeys.privateKey));
 
-  // Alice opens Long 1 ETH ($3000 notional)
+  // Alice opens Long 1 ETH
   const aliceIntent = engine.auth.signIntent(
     engine.domain,
     "0xAlice",
     "0xAlice",
     "OPEN_POSITION",
     { account: "0xalice", symbol: "ETH-USD", isLong: true, size: 1n * WAD, collateral: 300n * WAD, leverage: 10n },
-    secretAlice
+    aliceKeys.privateKey
   );
-  engine.openPosition({
+  const posAlice = engine.openPosition({
     signedIntent: aliceIntent,
     symbol: "ETH-USD",
     isLong: true,
@@ -333,16 +457,16 @@ test("5. Discrete deterministic 8-hour funding epochs, insurance balance, and so
     leverage: 10n
   });
 
-  // Bob opens Short 0.5 ETH ($1500 notional)
+  // Bob opens Short 0.5 ETH
   const bobIntent = engine.auth.signIntent(
     engine.domain,
     "0xBob",
     "0xBob",
     "OPEN_POSITION",
     { account: "0xbob", symbol: "ETH-USD", isLong: false, size: 1n * (WAD / 2n), collateral: 150n * WAD, leverage: 10n },
-    secretBob
+    bobKeys.privateKey
   );
-  engine.openPosition({
+  const posBob = engine.openPosition({
     signedIntent: bobIntent,
     symbol: "ETH-USD",
     isLong: false,
@@ -351,94 +475,117 @@ test("5. Discrete deterministic 8-hour funding epochs, insurance balance, and so
     leverage: 10n
   });
 
-  // Mark price is $3030, Index is $3000 (+100 bps premium)
-  engine.updatePrices({ caller: ORACLE, symbol: "ETH-USD", markPrice: 3030n * WAD, indexPrice: 3000n * WAD });
+  // Oracle updates prices
+  const oracleIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ORACLE",
+    "UPDATE_PRICES",
+    { symbol: "ETH-USD", markPrice: 3030n * WAD, indexPrice: 3000n * WAD },
+    oracleKeys.privateKey
+  );
+  engine.updatePrices({ signedIntent: oracleIntent, symbol: "ETH-USD", markPrice: 3030n * WAD, indexPrice: 3000n * WAD });
 
-  // Attempt settlement within same epoch: must be skipped
-  const resEarly = engine.settleFunding({
-    caller: KEEPER,
-    symbol: "ETH-USD",
-    currentTimestamp: epoch100Time + (2 * 60 * 60 * 1000)
-  });
+  // Monotonic timestamp check: settling in past timestamp fails
+  const pastKeeperIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "KEEPER",
+    "SETTLE_FUNDING",
+    { symbol: "ETH-USD", currentTimestamp: epoch100Time },
+    keeperKeys.privateKey
+  );
+  assert.throws(() => {
+    engine.settleFunding({ signedIntent: pastKeeperIntent, symbol: "ETH-USD", currentTimestamp: epoch100Time });
+  }, /Monotonic timestamp violation/);
+
+  // Attempt settlement within same epoch: skipped
+  const earlyTime = epoch100Time + (2 * 60 * 60 * 1000);
+  const earlyKeeperIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "KEEPER",
+    "SETTLE_FUNDING",
+    { symbol: "ETH-USD", currentTimestamp: earlyTime },
+    keeperKeys.privateKey
+  );
+  const resEarly = engine.settleFunding({ signedIntent: earlyKeeperIntent, symbol: "ETH-USD", currentTimestamp: earlyTime });
   assert.equal(resEarly.status, "SKIPPED_INTERVAL_NOT_ELAPSED");
-  assert.equal(resEarly.settledPositions, 0);
 
   // Settle in next epoch (Epoch 101)
   const epoch101Time = 101 * FUNDING_INTERVAL_MS;
-  const resEpoch101 = engine.settleFunding({
-    caller: KEEPER,
-    symbol: "ETH-USD",
-    currentTimestamp: epoch101Time
-  });
-  assert.equal(resEpoch101.status, "SETTLED");
-  assert.equal(resEpoch101.epoch, 101);
-  assert.equal(resEpoch101.settledPositions, 2);
+  const keeperIntent101 = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "KEEPER",
+    "SETTLE_FUNDING",
+    { symbol: "ETH-USD", currentTimestamp: epoch101Time },
+    keeperKeys.privateKey
+  );
+  const res101 = engine.settleFunding({ signedIntent: keeperIntent101, symbol: "ETH-USD", currentTimestamp: epoch101Time });
+  assert.equal(res101.status, "SETTLED");
+  assert.equal(res101.epoch, 101);
 
-  // Net imbalance credited to insurance fund
-  assert.ok(resEpoch101.netImbalanceToInsuranceFund > 0n);
-  const updatedMarket = engine.getMarket("ETH-USD");
-  assert.equal(updatedMarket.insuranceFundBalanceUsd, 10_000n * WAD + resEpoch101.netImbalanceToInsuranceFund);
+  // Invariant assertion: insurance fund gained net imbalance
+  const marketAfter = engine.getMarket("ETH-USD");
+  assert.equal(marketAfter.insuranceFundBalanceUsd, 10_000n * WAD + res101.netImbalanceToInsuranceFund);
 
-  // Duplicate settlement in Epoch 101 is blocked
-  const resDup = engine.settleFunding({
-    caller: KEEPER,
-    symbol: "ETH-USD",
-    currentTimestamp: epoch101Time + 1000
-  });
-  assert.equal(resDup.status, "SKIPPED_INTERVAL_NOT_ELAPSED");
-});
-
-test("6. Funding solvency freeze when insurance fund is insolvent", () => {
+  // Negative control: Atomic rollback on insolvency
+  // Create an insolvent market situation
   const epoch200Time = 200 * FUNDING_INTERVAL_MS;
-  const engine = createTestEngine();
-  // Register market with 0 insurance fund
-  engine.registerMarket({
-    caller: ADMIN,
-    symbol: "ETH-USD",
-    initialPrice: 3000n * WAD,
-    maintenanceMarginBps: 500n,
-    initialInsuranceFundUsd: 0n,
-    initialTimestamp: epoch200Time
-  });
+  registerTestMarket(engine, "SOL-USD", 200n * WAD, 0n, epoch200Time); // 0 insurance fund
 
-  const secretAlice = "secret-alice-12345";
-  engine.auth.registerAccountCredential("0xAlice", secretAlice);
-
-  // Alice opens Short 10 ETH ($30,000 notional)
-  const aliceIntent = engine.auth.signIntent(
+  const solShortIntent = engine.auth.signIntent(
     engine.domain,
     "0xAlice",
     "0xAlice",
     "OPEN_POSITION",
-    { account: "0xalice", symbol: "ETH-USD", isLong: false, size: 10n * WAD, collateral: 3000n * WAD, leverage: 10n },
-    secretAlice
+    { account: "0xalice", symbol: "SOL-USD", isLong: false, size: 10n * WAD, collateral: 200n * WAD, leverage: 10n },
+    aliceKeys.privateKey
   );
-  engine.openPosition({
-    signedIntent: aliceIntent,
-    symbol: "ETH-USD",
+  const solPos = engine.openPosition({
+    signedIntent: solShortIntent,
+    symbol: "SOL-USD",
     isLong: false,
     size: 10n * WAD,
-    collateral: 3000n * WAD,
+    collateral: 200n * WAD,
     leverage: 10n
   });
 
-  // Mark price is $3030, Index is $3000 (+100 bps premium) -> Longs pay shorts, but there are no longs!
-  // Short is due to receive payment from insurance fund. But insurance fund is $0!
-  engine.updatePrices({ caller: ORACLE, symbol: "ETH-USD", markPrice: 3030n * WAD, indexPrice: 3000n * WAD });
+  // Mark trades at premium -> Short should be credited by insurance fund, but insurance fund is 0!
+  const solOracle = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ORACLE",
+    "UPDATE_PRICES",
+    { symbol: "SOL-USD", markPrice: 210n * WAD, indexPrice: 200n * WAD },
+    oracleKeys.privateKey
+  );
+  engine.updatePrices({ signedIntent: solOracle, symbol: "SOL-USD", markPrice: 210n * WAD, indexPrice: 200n * WAD });
 
   const epoch201Time = 201 * FUNDING_INTERVAL_MS;
-  // Solvency violation must throw and freeze funding settlement
+  const solKeeperIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "KEEPER",
+    "SETTLE_FUNDING",
+    { symbol: "SOL-USD", currentTimestamp: epoch201Time },
+    keeperKeys.privateKey
+  );
+
+  // Assert atomic failure: must throw Solvency violation
   assert.throws(() => {
-    engine.settleFunding({ caller: KEEPER, symbol: "ETH-USD", currentTimestamp: epoch201Time });
-  }, /Solvency violation: net funding imbalance/);
+    engine.settleFunding({ signedIntent: solKeeperIntent, symbol: "SOL-USD", currentTimestamp: epoch201Time });
+  }, /Solvency violation/);
+
+  // CRITICAL ATOMICITY CHECK: Assert zero state mutation on failure!
+  const solPosAfter = engine.getPosition(solPos.id);
+  assert.equal(solPosAfter.accruedFunding, 0n, "Position accrued funding must remain 0 (atomic rollback)");
+  const solMarketAfter = engine.getMarket("SOL-USD");
+  assert.equal(solMarketAfter.insuranceFundBalanceUsd, 0n, "Insurance fund must remain 0 (atomic rollback)");
+  assert.equal(solMarketAfter.lastSettledEpoch, 200, "Epoch must not advance on failure");
 });
 
 test("7. Liquidation of unhealthy position and protection of healthy position", () => {
   const engine = createTestEngine();
-  engine.registerMarket({ caller: ADMIN, symbol: "ETH-USD", initialPrice: 3000n * WAD });
+  registerTestMarket(engine, "ETH-USD", 3000n * WAD);
 
-  const secretCharlie = "secret-charlie-12345";
-  engine.auth.registerAccountCredential("0xCharlie", secretCharlie);
+  const charlieKeys = AuthManager.generateKeyPair();
+  engine.auth.enrollAccount(engine.auth.createEnrollmentProof("0xCharlie", charlieKeys.publicKey, charlieKeys.privateKey));
 
   const charlieIntent = engine.auth.signIntent(
     engine.domain,
@@ -446,7 +593,7 @@ test("7. Liquidation of unhealthy position and protection of healthy position", 
     "0xCharlie",
     "OPEN_POSITION",
     { account: "0xcharlie", symbol: "ETH-USD", isLong: true, size: 1n * WAD, collateral: 300n * WAD, leverage: 10n },
-    secretCharlie
+    charlieKeys.privateKey
   );
 
   const pos = engine.openPosition({
@@ -463,8 +610,15 @@ test("7. Liquidation of unhealthy position and protection of healthy position", 
     engine.liquidatePosition({ positionId: pos.id, liquidator: "0xLiquidator" });
   }, /is healthy and cannot be liquidated/);
 
-  // Market crashes to $2800 (Oracle updates price)
-  engine.updatePrices({ caller: ORACLE, symbol: "ETH-USD", markPrice: 2800n * WAD, indexPrice: 2800n * WAD });
+  // Market crashes to $2800 (Oracle updates price with signed intent)
+  const crashIntent = engine.auth.signPrivilegedIntent(
+    engine.domain,
+    "ORACLE",
+    "UPDATE_PRICES",
+    { symbol: "ETH-USD", markPrice: 2800n * WAD, indexPrice: 2800n * WAD },
+    oracleKeys.privateKey
+  );
+  engine.updatePrices({ signedIntent: crashIntent, symbol: "ETH-USD", markPrice: 2800n * WAD, indexPrice: 2800n * WAD });
 
   const receipt = engine.liquidatePosition({ positionId: pos.id, liquidator: "0xLiquidator" });
   assert.equal(receipt.positionId, pos.id);

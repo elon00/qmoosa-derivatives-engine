@@ -1,8 +1,8 @@
 /**
- * QMOOSA Derivatives Engine — Margin Management, Position Ledger, Cryptographic Authentication & Liquidation State Machine
+ * QMOOSA Derivatives Engine — Margin Management, Position Ledger, Asymmetric Cryptographic Authentication & Liquidation State Machine
  */
 
-import { AuthManager, IntentDomain, SignedIntent } from "./auth.js";
+import { AuthManager, IntentDomain, SignedIntent, SignedPrivilegedIntent } from "./auth.js";
 
 export const WAD = 10n ** 18n;
 export const BPS_DIVISOR = 10_000n;
@@ -136,50 +136,62 @@ export interface LiquidationReceipt {
 export interface EngineConfig {
   chainId?: number;
   contractAddress?: string;
-  admin?: string;
-  oracleSigner?: string;
-  keeperSigner?: string;
+  adminPublicKey: string;
+  oraclePublicKey: string;
+  keeperPublicKey: string;
 }
 
 export class DerivativesEngine {
   private markets: Map<string, MarketState> = new Map();
   private positions: Map<string, Position> = new Map();
-  private approvedOperators: Map<string, Set<string>> = new Map(); // account -> approved operators
+  private approvedOperators: Map<string, Set<string>> = new Map();
   private nextPositionNonce: bigint = 1n;
 
   public readonly domain: IntentDomain;
-  public readonly admin: string;
-  public readonly oracleSigner: string;
-  public readonly keeperSigner: string;
+  public readonly adminPublicKey: string;
+  public readonly oraclePublicKey: string;
+  public readonly keeperPublicKey: string;
   public readonly auth: AuthManager = new AuthManager();
 
-  constructor(config: EngineConfig = {}) {
+  constructor(config: EngineConfig) {
+    if (!config.adminPublicKey || !config.oraclePublicKey || !config.keeperPublicKey) {
+      throw new Error("Engine configuration requires verified public keys for admin, oracle, and keeper roles");
+    }
+
     this.domain = {
       chainId: config.chainId ?? DEFAULT_CHAIN_ID,
       contractAddress: (config.contractAddress ?? DEFAULT_CONTRACT_ADDRESS).toLowerCase()
     };
-    this.admin = (config.admin ?? "0xAdmin").toLowerCase();
-    this.oracleSigner = (config.oracleSigner ?? "0xOracle").toLowerCase();
-    this.keeperSigner = (config.keeperSigner ?? "0xKeeper").toLowerCase();
+    this.adminPublicKey = config.adminPublicKey;
+    this.oraclePublicKey = config.oraclePublicKey;
+    this.keeperPublicKey = config.keeperPublicKey;
   }
 
   /**
-   * Registers a new perpetual market. Privileged operation reserved for the admin.
+   * Registers a new perpetual market.
+   * STRICT SECURITY: Privileged operation requiring an Ed25519-signed intent from the Administrator.
+   * String-only callers are strictly rejected.
    */
   public registerMarket(params: {
-    caller: string;
+    signedIntent: SignedPrivilegedIntent;
     symbol: string;
     initialPrice: bigint;
     maintenanceMarginBps?: bigint;
     initialInsuranceFundUsd?: bigint;
     initialTimestamp?: number;
   }): MarketState {
-    const { caller, symbol, initialPrice, maintenanceMarginBps = DEFAULT_MAINTENANCE_MARGIN_BPS, initialInsuranceFundUsd = 0n, initialTimestamp = 0 } = params;
+    const {
+      signedIntent,
+      symbol,
+      initialPrice,
+      maintenanceMarginBps = DEFAULT_MAINTENANCE_MARGIN_BPS,
+      initialInsuranceFundUsd = 0n,
+      initialTimestamp = 0
+    } = params;
 
-    if (!caller || caller.toLowerCase() !== this.admin) {
-      throw new Error(`Unauthorized: caller ${caller} is not the market administrator`);
+    if (!signedIntent) {
+      throw new Error("Administrator signed intent is strictly required to register a market");
     }
-
     if (!symbol || symbol.trim().length === 0) {
       throw new Error("Invalid market symbol");
     }
@@ -187,10 +199,28 @@ export class DerivativesEngine {
       throw new RangeError("Initial price must be strictly positive");
     }
 
+    const s = symbol.toUpperCase();
+
+    // Verify cryptographic signature against Admin public key
+    this.auth.verifyAndConsumePrivilegedIntent(
+      this.domain,
+      signedIntent,
+      "ADMIN",
+      "REGISTER_MARKET",
+      {
+        symbol: s,
+        initialPrice,
+        maintenanceMarginBps,
+        initialInsuranceFundUsd,
+        initialTimestamp
+      },
+      this.adminPublicKey
+    );
+
     const initialEpoch = Math.floor(initialTimestamp / FUNDING_INTERVAL_MS);
 
     const market: MarketState = {
-      symbol: symbol.toUpperCase(),
+      symbol: s,
       markPrice: initialPrice,
       indexPrice: initialPrice,
       fundingRateBps: 0n,
@@ -205,9 +235,51 @@ export class DerivativesEngine {
   }
 
   /**
+   * Updates mark and index prices for a market.
+   * STRICT SECURITY: Privileged operation requiring an Ed25519-signed intent from the Oracle.
+   */
+  public updatePrices(params: {
+    signedIntent: SignedPrivilegedIntent;
+    symbol: string;
+    markPrice: bigint;
+    indexPrice: bigint;
+  }): MarketState {
+    const { signedIntent, symbol, markPrice, indexPrice } = params;
+
+    if (!signedIntent) {
+      throw new Error("Oracle signed intent is strictly required to update prices");
+    }
+
+    const s = symbol.toUpperCase();
+    const market = this.markets.get(s);
+    if (!market) throw new Error(`Market ${s} is not registered`);
+    if (markPrice <= 0n || indexPrice <= 0n) {
+      throw new RangeError("Prices must be strictly positive");
+    }
+
+    // Verify cryptographic signature against Oracle public key
+    this.auth.verifyAndConsumePrivilegedIntent(
+      this.domain,
+      signedIntent,
+      "ORACLE",
+      "UPDATE_PRICES",
+      {
+        symbol: s,
+        markPrice,
+        indexPrice
+      },
+      this.oraclePublicKey
+    );
+
+    market.markPrice = markPrice;
+    market.indexPrice = indexPrice;
+    market.fundingRateBps = calculateFundingRate(markPrice, indexPrice);
+    return { ...market };
+  }
+
+  /**
    * Approves or revokes an operator for an account.
-   * STRICT SECURITY: Requires a cryptographically verified signed intent from the account owner.
-   * No arbitrary or unauthenticated caller fallback is permitted.
+   * STRICT SECURITY: Requires a cryptographically verified signed intent from the enrolled account owner.
    */
   public setApprovedOperator(params: {
     signedIntent: SignedIntent;
@@ -231,7 +303,7 @@ export class DerivativesEngine {
       throw new Error(`Unauthorized operator approval: caller ${clr} cannot approve operators for ${acc}`);
     }
 
-    // Verify cryptographic intent against canonical payload
+    // Verify cryptographic intent against canonical payload and enrolled key
     this.auth.verifyAndConsumeIntent(
       this.domain,
       signedIntent,
@@ -264,37 +336,9 @@ export class DerivativesEngine {
   }
 
   /**
-   * Updates mark and index prices for a market.
-   * Privileged operation reserved for the authorized oracle signer.
-   */
-  public updatePrices(params: {
-    caller: string;
-    symbol: string;
-    markPrice: bigint;
-    indexPrice: bigint;
-  }): MarketState {
-    const { caller, symbol, markPrice, indexPrice } = params;
-    if (!caller || caller.toLowerCase() !== this.oracleSigner) {
-      throw new Error(`Unauthorized: caller ${caller} is not the authorized oracle signer`);
-    }
-
-    const s = symbol.toUpperCase();
-    const market = this.markets.get(s);
-    if (!market) throw new Error(`Market ${s} is not registered`);
-    if (markPrice <= 0n || indexPrice <= 0n) {
-      throw new RangeError("Prices must be strictly positive");
-    }
-
-    market.markPrice = markPrice;
-    market.indexPrice = indexPrice;
-    market.fundingRateBps = calculateFundingRate(markPrice, indexPrice);
-    return { ...market };
-  }
-
-  /**
    * Opens a new perpetual position.
    * STRICT SECURITY: Signed intent is MANDATORY.
-   * Caller must be the account owner or an approved operator.
+   * Verified against the enrolled account's public key.
    */
   public openPosition(params: {
     signedIntent: SignedIntent;
@@ -322,7 +366,7 @@ export class DerivativesEngine {
       throw new Error(`Unauthorized: caller ${caller} is not authorized for account ${acc}`);
     }
 
-    // Cryptographic intent verification against canonical action and parameters
+    // Cryptographic intent verification against canonical action, parameters, and enrolled public key
     this.auth.verifyAndConsumeIntent(
       this.domain,
       signedIntent,
@@ -366,14 +410,12 @@ export class DerivativesEngine {
 
   /**
    * Settles dynamic funding across all positions in a market.
-   * Enforces discrete deterministic 8-hour funding epochs:
-   * currentEpoch = floor(currentTime / FUNDING_INTERVAL_MS).
-   * Guarantees exact counterparty funding conservation against market insurance fund.
-   * Privileged operation reserved for the authorized settlement keeper.
-   * Strict solvency check: triggers fail-closed error if insurance fund cannot absorb net imbalance.
+   * STRICT SECURITY: Privileged operation requiring an Ed25519-signed intent from the Keeper.
+   * Enforces discrete deterministic 8-hour funding epochs and strictly monotonic timestamps.
+   * ATOMIC SOLVENCY GUARANTEE: Pre-validates insurance solvency; on failure, state is 100% unchanged.
    */
   public settleFunding(params: {
-    caller: string;
+    signedIntent: SignedPrivilegedIntent;
     symbol: string;
     currentTimestamp?: number;
   }): {
@@ -385,15 +427,33 @@ export class DerivativesEngine {
     netImbalanceToInsuranceFund: bigint;
     status: "SETTLED" | "SKIPPED_INTERVAL_NOT_ELAPSED";
   } {
-    const { caller, symbol, currentTimestamp = Date.now() } = params;
+    const { signedIntent, symbol, currentTimestamp = Date.now() } = params;
 
-    if (!caller || caller.toLowerCase() !== this.keeperSigner) {
-      throw new Error(`Unauthorized: caller ${caller} is not the authorized settlement keeper`);
+    if (!signedIntent) {
+      throw new Error("Settlement keeper signed intent is strictly required");
     }
 
     const s = symbol.toUpperCase();
     const market = this.markets.get(s);
     if (!market) throw new Error(`Market ${s} is not registered`);
+
+    // Verify cryptographic keeper signature
+    this.auth.verifyAndConsumePrivilegedIntent(
+      this.domain,
+      signedIntent,
+      "KEEPER",
+      "SETTLE_FUNDING",
+      {
+        symbol: s,
+        currentTimestamp
+      },
+      this.keeperPublicKey
+    );
+
+    // Monotonic timestamp validation
+    if (currentTimestamp <= market.lastFundingSettledAt) {
+      throw new Error(`Monotonic timestamp violation: current timestamp ${currentTimestamp} <= last settled ${market.lastFundingSettledAt}`);
+    }
 
     const currentEpoch = Math.floor(currentTimestamp / FUNDING_INTERVAL_MS);
 
@@ -410,15 +470,17 @@ export class DerivativesEngine {
       };
     }
 
+    // Step 1: Pre-calculate payments in preview mode without mutating ANY position
     let count = 0;
     let totalLongPayment = 0n;
     let totalShortPayment = 0n;
+    const pendingPayments: { position: Position; payment: bigint }[] = [];
 
     for (const pos of this.positions.values()) {
       if (pos.marketSymbol === market.symbol) {
         const notional = calculateNotional(pos.size, market.markPrice);
         const payment = calculateFundingPayment(pos.isLong, notional, market.fundingRateBps);
-        pos.accruedFunding += payment;
+        pendingPayments.push({ position: pos, payment });
         if (pos.isLong) {
           totalLongPayment += payment;
         } else {
@@ -428,22 +490,26 @@ export class DerivativesEngine {
       }
     }
 
-    // Net funding imbalance: long payments + short payments (short payments are negative when receiving)
     const netImbalance = totalLongPayment + totalShortPayment;
 
-    // Solvency check: if netImbalance is negative (insurance fund pays out), ensure insurance fund is solvent
+    // Step 2: Solvency check BEFORE any mutation occurs (Atomic Fail-Closed Guarantee)
     if (market.insuranceFundBalanceUsd + netImbalance < 0n) {
       throw new Error(
-        `Solvency violation: net funding imbalance ${netImbalance} exceeds available insurance fund ${market.insuranceFundBalanceUsd}. Settlement frozen.`
+        `Solvency violation: net funding imbalance ${netImbalance} exceeds available insurance fund ${market.insuranceFundBalanceUsd}. Settlement atomically aborted.`
       );
     }
 
+    // Step 3: Apply state mutations atomically
     const initialInsurance = market.insuranceFundBalanceUsd;
+    for (const { position, payment } of pendingPayments) {
+      position.accruedFunding += payment;
+    }
+
     market.insuranceFundBalanceUsd += netImbalance;
     market.lastFundingSettledAt = currentTimestamp;
     market.lastSettledEpoch = currentEpoch;
 
-    // Strict conservation invariant assertion: change in insurance fund must exactly balance net positions imbalance
+    // Strict conservation invariant assertion
     if (market.insuranceFundBalanceUsd - initialInsurance !== netImbalance) {
       throw new Error("Funding payment conservation invariant violated");
     }
@@ -462,7 +528,6 @@ export class DerivativesEngine {
   /**
    * Closes an active position and returns net settlement receipt.
    * STRICT SECURITY: Signed intent is MANDATORY.
-   * Caller must be position owner or approved operator.
    */
   public closePosition(params: {
     signedIntent: SignedIntent;
@@ -480,17 +545,15 @@ export class DerivativesEngine {
     const acc = signedIntent.account.toLowerCase();
     const caller = signedIntent.caller.toLowerCase();
 
-    // Verify account ownership
     if (position.account.toLowerCase() !== acc) {
       throw new Error(`Unauthorized: intent account ${acc} does not own position ${positionId}`);
     }
 
-    // Actor authorization boundary: caller must be owner or approved operator
     if (!this.isAuthorizedCaller(acc, caller)) {
       throw new Error(`Unauthorized: caller ${caller} is not authorized for account ${acc}`);
     }
 
-    // Verify cryptographic intent
+    // Verify cryptographic intent against enrolled public key
     this.auth.verifyAndConsumeIntent(
       this.domain,
       signedIntent,
@@ -528,7 +591,7 @@ export class DerivativesEngine {
   }
 
   /**
-   * Liquidates an unhealthy position. Permissionless incentive mechanism.
+   * Liquidates an unhealthy position.
    */
   public liquidatePosition(params: {
     liquidator: string;

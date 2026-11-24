@@ -1,3 +1,6 @@
 node_modules
 dist
 .DS_Store
+
+# Lean 4 build artifacts
+lean_verify/.lake/
